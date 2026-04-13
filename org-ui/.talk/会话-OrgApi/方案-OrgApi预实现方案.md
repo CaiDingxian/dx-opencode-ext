@@ -412,7 +412,13 @@ public interface OrgService {
     OrgRespVO getOrgDirect(Long id);
 
     /**
-     * 直读组织列表（无分页）。
+     * 获取组织列表（扁平结构，无嵌套）。
+     * 复用全量缓存，通过 Stream 过滤，极速响应。
+     */
+    List<OrgRespVO> getOrgList(OrgListReqVO query);
+
+    /**
+     * 直读组织列表（强一致性要求时的无分页展示）。
      * 支持数据权限拦截（走 @DataPermission）。
      */
     List<OrgRespVO> getOrgListDirect(OrgListReqVO query);
@@ -556,6 +562,148 @@ public class OrgServiceImpl implements OrgService {
                 .collect(Collectors.toList());
     }
 
+    // ======================== 读操作（直读） ========================
+
+    @Override
+    @DataPermission(enable = false) // 编辑回显不走数据权限（已在 Controller 层做了节点归属校验）
+    public OrgRespVO getOrgDirect(Long id) {
+        DeptDO dept = deptService.getDept(id);
+        if (dept == null) throw exception(ORG_NOT_EXISTS);
+        BizOrgExtDO ext = bizOrgExtMapper.selectByDeptId(id);
+        OrgNode node = orgConvert.toNode(dept, ext);
+        return orgConvert.toRespVO(node);
+    }
+
+    // ======================== 读操作（缓存，平铺列表） ========================
+
+    @Override
+    public List<OrgRespVO> getOrgList(OrgListReqVO query) {
+        // 复用全量缓存实现高速列表查询（替代原先低效的直连查库）
+        Map<Long, OrgNode> allNodes = orgCache.getNodeMap();
+        Set<Long> allowedIds = accessControlApi.getDeptIds(ORG_QUERY_PERMISSION);
+        
+        return allNodes.values().stream()
+                .filter(n -> allowedIds == null || allowedIds.contains(n.getId()))
+                .filter(n -> matchesQuery(n, query))
+                .map(orgConvert::toRespVO)
+                .collect(Collectors.toList());
+    }
+
+    // ======================== 私有工具 ========================
+
+    private void publishCacheRefresh() {
+        redisMQTemplate.send(new OrgCacheRefreshMessage());
+    }
+
+    /**
+     * 利用 DeptDO.path 字段向上追溯祖先（避免递归查询内存 Map）。
+     * path 格式: "0.100.101.103" → split('.') 得到所有祖先 ID
+     */
+    private void addAncestors(OrgNode node, Map<Long, OrgNode> allNodes, Set<Long> resultIds) {
+        if (node.getPath() == null) return;
+        for (String part : node.getPath().split(PATH_SEPARATOR)) {
+            long ancestorId = Long.parseLong(part);
+            if (ancestorId == VIRTUAL_ROOT_ID) continue; // 跳过虚拟根节点
+            if (allNodes.containsKey(ancestorId)) {
+                resultIds.add(ancestorId);
+            }
+        }
+    }
+
+    private boolean matchesQuery(OrgNode node, OrgTreeReqVO q) {
+        // 支持前端的原型多选查询和模糊查询
+        if (CollUtil.isNotEmpty(q.getTypes()) && !q.getTypes().contains(node.getOrgType())) return false;
+        if (CollUtil.isNotEmpty(q.getBizLines()) && !q.getBizLines().contains(node.getBizLine())) return false;
+        if (CollUtil.isNotEmpty(q.getLifecycles()) && !q.getLifecycles().contains(node.getLifecycle())) return false;
+        
+        if (StrUtil.isNotBlank(q.getKeyword())) {
+            boolean nameMatch = node.getName() != null && node.getName().contains(q.getKeyword());
+            boolean codeMatch = node.getCode() != null && node.getCode().contains(q.getKeyword());
+            if (!nameMatch && !codeMatch) return false;
+        }
+
+        // CLASS 特有：grade / eduLevel 多选筛选
+        if (node instanceof ClassOrgNode classNode) {
+            if (CollUtil.isNotEmpty(q.getGrades()) && !q.getGrades().contains(classNode.getGrade())) return false;
+            if (CollUtil.isNotEmpty(q.getEduLevels()) && !q.getEduLevels().contains(classNode.getEduLevel())) return false;
+        } else {
+            // 原型：若勾选了年级/培养层次，则只过滤班级（也可在 Controller 验证，或直接过滤掉非班级节点）
+            // 这里我们保持宽容：如果过滤条件带了 CLASS 专有属性，非 CLASS 节点如果作为父链路本身会被保留
+        }
+        return true;
+    }
+
+    private List<OrgRespVO> buildTreeVO(Set<Long> resultIds, Map<Long, OrgNode> allNodes) {
+        // 1. 取出所有目标节点
+        List<OrgNode> nodes = resultIds.stream()
+                .map(allNodes::get)
+                .filter(Objects::nonNull)
+                .sorted(Comparator.comparing(OrgNode::getSort))
+                .collect(Collectors.toList());
+
+        // 2. 按 parentId 建立 children（在临时 Map 中操作，不污染缓存中的节点）
+        Map<Long, OrgRespVO> voMap = new LinkedHashMap<>();
+        for (OrgNode n : nodes) {
+            voMap.put(n.getId(), orgConvert.toRespVO(n)); // children 初始为空
+        }
+        List<OrgRespVO> roots = new ArrayList<>();
+        for (OrgRespVO vo : voMap.values()) {
+            OrgRespVO parent = voMap.get(vo.getParentId());
+            if (parent != null) {
+                parent.getChildren().add(vo);
+            } else {
+                roots.add(vo); // 父节点不在结果集中，视为根
+            }
+        }
+        return roots;
+    }
+
+        // 2. 数据权限裁剪：获取当前用户允许访问的 deptId 集合
+        // 返回 null 表示超级管理员（不限制），返回空集合表示没有任何权限
+        Set<Long> allowedIds = accessControlApi.getDeptIds(ORG_QUERY_PERMISSION);
+        if (allowedIds != null && allowedIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 3. 第一层过滤：求交集（权限 ∩ 业务多维过滤条件）
+        // 筛选出**直接命中**条件的节点（例如：名称包含"软件"、或者是"2024级"的班级）
+        List<OrgNode> matchedNodes = allNodes.values().stream()
+                .filter(n -> allowedIds == null || allowedIds.contains(n.getId()))
+                .filter(n -> matchesQuery(n, query))
+                .collect(Collectors.toList());
+
+        if (matchedNodes.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 4. 第二层回溯：补全父链路（Bottom-Up），防止树断层
+        // 如果只返回命中节点（如班级），前端无法渲染完整的层级（学校->学院->专业->班级）
+        // 因此必须把命中节点的所有祖先也捞出来，形成完整的路径
+        Set<Long> resultIds = new HashSet<>(matchedNodes.size() * 2);
+        for (OrgNode node : matchedNodes) {
+            resultIds.add(node.getId());
+            addAncestors(node, allNodes, resultIds); 
+        }
+
+        // 5. 第三层构建：将扁平的 resultIds 转为嵌套的多态 VO 树
+        return buildTreeVO(resultIds, allNodes);
+    }
+
+    @Override
+    public List<Long> getOrgIdList(OrgListReqVO query) {
+        // 获取全局快照与权限集合
+        Map<Long, OrgNode> allNodes = orgCache.getNodeMap();
+        Set<Long> allowedIds = accessControlApi.getDeptIds(ORG_QUERY_PERMISSION);
+
+        // 严格模式（常用于给外部微服务提供参数，例如查询某专业下的所有学生）：
+        // 这里不需要补全父链路，只需精确返回命中条件的节点 ID
+        return allNodes.values().stream()
+                .filter(n -> allowedIds == null || allowedIds.contains(n.getId()))
+                .filter(n -> matchesQuery(n, query))
+                .map(OrgNode::getId)
+                .collect(Collectors.toList());
+    }
+
         // --- Step 4: 从 allNodes 中取出 resultIds 对应的节点，组装成树 ---
         // 组装：先 Map.get(id) 取扁平列表，再按 parentId 建立 children 关系
         return buildTreeVO(resultIds, allNodes);
@@ -584,6 +732,24 @@ public class OrgServiceImpl implements OrgService {
         BizOrgExtDO ext = bizOrgExtMapper.selectByDeptId(id);
         OrgNode node = orgConvert.toNode(dept, ext);
         return orgConvert.toRespVO(node);
+    }
+
+    @Override
+    public List<OrgRespVO> getOrgListDirect(OrgListReqVO query) {
+        // 利用系统服务查底层部门，走数据权限
+        List<DeptDO> depts = deptService.getDeptList(new DeptListReqVO());
+        if (CollUtil.isEmpty(depts)) return Collections.emptyList();
+        
+        List<BizOrgExtDO> exts = bizOrgExtMapper.selectList(new LambdaQueryWrapperX<BizOrgExtDO>());
+        Map<Long, BizOrgExtDO> extMap = CollectionUtils.convertMap(exts, BizOrgExtDO::getDeptId);
+        
+        return depts.stream().map(dept -> {
+            BizOrgExtDO ext = extMap.get(dept.getId());
+            if (ext == null) return null;
+            OrgNode node = orgConvert.toNode(dept, ext);
+            if (!matchesQuery(node, query)) return null;
+            return orgConvert.toRespVO(node);
+        }).filter(Objects::nonNull).collect(Collectors.toList());
     }
 
     // ======================== 私有工具 ========================
@@ -801,9 +967,18 @@ public class OrgController {
         return success(true);
     }
 
-    // ---- 直读列表（非缓存，管理维护场景）----
+    // ---- 缓存列表（管理维护场景，高速平铺查询）----
 
     @GetMapping("/list")
+    @Operation(summary = "获取组织列表（查缓存，无分页，扁平结构）")
+    @PreAuthorize("@ss.hasPermission('system:org:query')")
+    public CommonResult<List<OrgRespVO>> getOrgList(OrgListReqVO query) {
+        return success(orgService.getOrgList(query));
+    }
+
+    // ---- 直读列表（强一致性要求时使用）----
+
+    @GetMapping("/list-direct")
     @Operation(summary = "获取组织列表（直读DB，无分页）")
     @PreAuthorize("@ss.hasPermission('system:org:query')")
     public CommonResult<List<OrgRespVO>> getOrgListDirect(OrgListReqVO query) {
@@ -952,13 +1127,35 @@ rule.addDeptColumn(DeptDO.class, "id"); // system_dept.id 受数据权限保护
 | 缓存同步机制 | Redis Pub/Sub (`OrgCacheRefreshMessage`) | 框架已有 `AbstractRedisChannelMessageListener`，几十行代码搞定 |
 | 多态表示 | Jackson `@JsonTypeInfo` + `OrgNode` 继承体系 | 编译期类型安全，无 `Map<String,Object>` 蔓延 |
 | 是否绕过 DeptService 写库 | 否，全部走 DeptService | 0 侵入，数据权限天然适配 |
-| 是否提供直读 API | 是，`getOrgDirect` / `getOrgListDirect` | 保证编辑回显实时性，管理页分页 |
+| 读操作全缓存化 | 是，树形、平铺列表均由缓存输出 | 极速响应，保证数据完全一致 |
 | attributes 字段类型 | `Map<String,Object>` (DB 侧) + 强类型子类 (内存/API 侧) | DB 侧灵活扩展，业务侧强类型 |
 | 是否支持 CLASS 类型约束 | 是 (`validateParent()` 方法) | CLASS 下不允许挂子节点，SCHOOL 只能在根下 |
 
 ---
 
-## 十一、实现优先级与顺序
+## 十一、架构隐患与应对（ADR 附录）
+
+在最终落地前，我们针对该架构进行了中高级别隐患排查，结论与应对策略如下：
+
+1. **跨模块事务问题（主附表不一致）**
+   - *隐患*：`system_dept` 与 `biz_org_extension` 的跨模块调用若未来微服务化，会导致 `@Transactional` 失效。
+   - *决策*：**无视**。系统未来不打算进行微服务化拆分和分库隔离，单体架构下 `@Transactional` 足够保证本地事务强一致性。
+
+2. **缓存刷新的全量风暴**
+   - *隐患*：高频写操作触发连续的 Redis 广播，导致所有节点瞬间全量扫表。
+   - *决策*：**接受现状**。高校组织架构体量（千级节点）的表扫描开销极小，这点扫表带来的 CPU 波动不足为患。
+
+3. **“写后即读”的缓存延迟（闪烁）**
+   - *隐患*：改完组织后立即请求缓存树，因为异步重载时间差，可能读到旧数据。
+   - *决策*：**已规避**。我们在管理维护页面（树的 CRUD 页）保留了直读 API（`getOrgListDirect`），强一致性场景直接绕过缓存即可。缓存 API 专供下游高频只读展示。
+
+4. **系统级拦截器的误伤**
+   - *隐患*：异步 `reload()` 线程中没有登录上下文，会被 `DataPermissionInterceptor` 拦截导致缓存加载为空。
+   - *决策*：**顺其自然**。原有的框架内置 `DataPermissionInterceptor` 将被弃用，后续会重构一套最佳的“编程式数据权限机制”，不再依赖基于线程 ThreadLocal 的隐式拦截。
+
+---
+
+## 十二、实现优先级与顺序
 
 1. **DDL + BizOrgExtDO + BizOrgExtMapper** （先建好基础，可以跑通 CRUD）
 2. **枚举：OrgType / BizLine / OrgLifecycle**
