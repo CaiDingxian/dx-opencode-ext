@@ -1,10 +1,5 @@
 # Coder Agent 阅读版预实现方案 (OrgApi)
 
-> **致 Coder Agent：**
-> 本文档为你生成代码的**绝对指导大纲**。在落实组织架构 (OrgApi) 模块时，请**严格遵守**以下上下文背景、设计决策以及实现红线，**禁止任何形式的自我发挥或“炫技”**，尤其不要引入未经允许的设计模式或复杂抽象。
-
----
-
 ## 零、项目上下文与全局设定
 
 1. **包位置**：所有代码必须存放在 `bsy-module-biz` 模块下的 `com.bossyun.module.biz.subject.org` 包中。
@@ -123,16 +118,3 @@ public class ClassOrgSaveReqVO extends OrgSaveReqVO {
 
 4. **严格直读 DB 单体（编辑回显使用）**：`getOrgDirect(Long id)`
    - 用于管理台点击“编辑”获取最新持久化状态。
-
----
-
-## 五、防坑速查表 (Checklist)
-在提交代码前，Coder Agent 必须自我核对：
-- [ ] 是否不小心写了 `tenantId` 相关的代码？(**不允许**)
-- [ ] Controller 里有没有用到 `PageResult` 分页对象？(**不允许**)
-- [ ] 存取 `attributes` JSON 时，有没有手敲 `"grade"` 等魔法值？(**不允许，必须用 Lombok 静态变量**)
-- [ ] 是否试图在 `biz_org_extension` 的 `extMapper` 中造一棵树？(**不允许，必须用 System 模块的 `DeptService`**)
-- [ ] 是否新建了独立的 `OrgNode` 或 `ClassOrgNode` 等中间实体类？(**不允许，直接复用合并了 `@TableField(exist=false)` 的 `BizOrgExtDO` 进行运算**)
-- [ ] UI 的 `status` ("PREPARING") 在数据库应当名为 `lifecycleStatus`，是否区分清楚了它和框架自带的停启用 `status` 的差异？(**必须清楚区分**)
-
-> 你现在的目标是成为最高效、最克制的编码执行机器。遵守本文档的每一行约定。
