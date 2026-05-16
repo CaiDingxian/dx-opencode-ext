@@ -29,4 +29,4 @@
 
 这个插件接管 OpenCode 的实验性会话压缩流程，在触发 compacting 时清空默认上下文，并注入一段更偏向任务交接摘要的压缩提示词。
 
-它的目标是把上下文压缩结果变成类似 Codex 的 handoff summary，帮助后续模型更顺畅地续写任务；如果将 OpenCode 的 compression agent 配置为 GPT-5.x 系列模型，通常可以获得更好的压缩质量。
+它的目标是把上下文压缩结果变成与 Codex 一致的 handoff summary，（prompt完全来着codex开源）帮助后续模型更顺畅地续写任务；如果将 OpenCode 的 compression agent 配置为 GPT-5.x 系列模型，通常可以获得更好的压缩质量。
