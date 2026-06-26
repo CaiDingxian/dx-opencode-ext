@@ -32,22 +32,22 @@ function hasReasoning(part: Part): part is Part & { type: "reasoning"; text: str
   return part.type === "reasoning" && typeof (part as { text?: unknown }).text === "string"
 }
 
-function wrapCommentary(text: string) {
-  return `<commentary>${text.trim()}</commentary>`
+function wrapthinking(text: string) {
+  return `<thinking>${text.trim()}</thinking>`
 }
 
 function mergeReasoningIntoText(message: MessageWithParts) {
   if (message.info.role !== "assistant") return false
 
-  const commentary = message.parts.filter(hasReasoning).map((part) => part.text.trim()).filter(Boolean).join("\n\n")
-  if (!commentary) return false
+  const thinking = message.parts.filter(hasReasoning).map((part) => part.text.trim()).filter(Boolean).join("\n\n")
+  if (!thinking) return false
 
   const text = message.parts.find(hasText)
-  if (text?.text.includes("<commentary>")) return false
+  if (text?.text.includes("<thinking>")) return false
 
   // 将历史思考内容折叠进正文，规避不支持保留思考参数的供应商。
   if (text) {
-    text.text = [wrapCommentary(commentary), text.text].filter(Boolean).join("\n")
+    text.text = [wrapthinking(thinking), text.text].filter(Boolean).join("\n")
   } else {
     const firstReasoning = message.parts.find(hasReasoning)!
     message.parts.unshift({
@@ -55,7 +55,7 @@ function mergeReasoningIntoText(message: MessageWithParts) {
       sessionID: firstReasoning.sessionID,
       messageID: firstReasoning.messageID,
       type: "text",
-      text: wrapCommentary(commentary),
+      text: wrapthinking(thinking),
       synthetic: true,
     })
   }

@@ -13,16 +13,16 @@
 │  (admin-api/system/org)                                       │
 ├──────────────────────────────────────────────────────────────┤
 │  Service     OrgServiceImpl                                   │
-│              ├─ 写路径: DeptService (黑盒) + BizOrgExtMapper  │
+│              ├─ 写路径: DeptService (黑盒) + HeOrgExtMapper  │
 │              ├─ 读路径(缓存): OrgCache.get(tenantId)         │
-│              └─ 读路径(直读): DeptMapper + BizOrgExtMapper    │
+│              └─ 读路径(直读): DeptMapper + HeOrgExtMapper    │
 ├──────────────────────────────────────────────────────────────┤
 │  Cache       OrgCache                                         │
 │              ├─ 存储: AtomicReference<Map<Long,OrgNode>>     │
 │              ├─ 初始化: @PostConstruct + ApplicationReady    │
 │              └─ 失效: Redis Pub/Sub → OrgCacheRefreshConsumer│
 ├──────────────────────────────────────────────────────────────┤
-│  DAL         system_dept (DeptDO)  +  biz_org_extension      │
+│  DAL         system_dept (DeptDO)  +  he_org_extension      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,9 +54,9 @@ com.bossyun.module.biz.subject.org
 │
 ├── dal
 │   ├── dataobject
-│   │   └── BizOrgExtDO.java
+│   │   └── HeOrgExtDO.java
 │   └── mysql
-│       └── BizOrgExtMapper.java
+│       └── HeOrgExtMapper.java
 │
 ├── service
 │   ├── OrgService.java
@@ -80,7 +80,7 @@ com.bossyun.module.biz.subject.org
 
 ```sql
 -- 无需修改 system_dept，仅新增一张附表
-CREATE TABLE biz_org_extension (
+CREATE TABLE he_org_extension (
     dept_id         BIGINT          PRIMARY KEY,    -- FK → system_dept.id (逻辑外键)
     code            VARCHAR(64),                    -- 组织编码（业务编码，系统生成/手填，原型有展示）
     org_type        VARCHAR(32)     NOT NULL,       -- SCHOOL | COLLEGE | MAJOR | CLASS | REGULAR_DEPT
@@ -100,7 +100,7 @@ CREATE TABLE biz_org_extension (
 );
 
 -- 索引：全量加载时使用
-CREATE INDEX idx_biz_org_ext_deleted ON biz_org_extension (deleted);
+CREATE INDEX idx_he_org_ext_deleted ON he_org_extension (deleted);
 ```
 
 ### 3.2 枚举定义
@@ -134,7 +134,7 @@ public enum OrgLifecycle {
 
 ## 四、持久化层（DAL）
 
-### 4.1 BizOrgExtDO — MyBatis-Plus 实体
+### 4.1 HeOrgExtDO — MyBatis-Plus 实体
 
 ```java
 /**
@@ -142,10 +142,10 @@ public enum OrgLifecycle {
  * 多态由 attributes 字段 + 内存层 OrgNode 体系承载。
  * 这样可以避免 MyBatis-Plus 无法原生处理继承映射的尴尬。
  */
-@TableName(value = "biz_org_extension", autoResultMap = true)
+@TableName(value = "he_org_extension", autoResultMap = true)
 @Data
 @EqualsAndHashCode(callSuper = true)
-public class BizOrgExtDO extends BaseDO {
+public class HeOrgExtDO extends BaseDO {
 
     /** 与 system_dept.id 1:1 绑定，手动输入，不自增 */
     @TableId(type = IdType.INPUT)
@@ -166,15 +166,15 @@ public class BizOrgExtDO extends BaseDO {
 }
 ```
 
-### 4.2 BizOrgExtMapper
+### 4.2 HeOrgExtMapper
 
 ```java
 @Mapper
-public interface BizOrgExtMapper extends BaseMapperX<BizOrgExtDO> {
+public interface HeOrgExtMapper extends BaseMapperX<HeOrgExtDO> {
 
     /** 按 deptId 查单条（直读场景） */
-    default BizOrgExtDO selectByDeptId(Long deptId) {
-        return selectOne(BizOrgExtDO::getDeptId, deptId);
+    default HeOrgExtDO selectByDeptId(Long deptId) {
+        return selectOne(HeOrgExtDO::getDeptId, deptId);
     }
 
     /**
@@ -183,9 +183,9 @@ public interface BizOrgExtMapper extends BaseMapperX<BizOrgExtDO> {
      * 因为缓存加载是系统级行为，不属于任何用户请求上下文。
      */
     @DataPermission(enable = false)
-    default List<BizOrgExtDO> selectListAll() {
-        return selectList(new LambdaQueryWrapperX<BizOrgExtDO>()
-                .eq(BizOrgExtDO::getDeleted, false));
+    default List<HeOrgExtDO> selectListAll() {
+        return selectList(new LambdaQueryWrapperX<HeOrgExtDO>()
+                .eq(HeOrgExtDO::getDeleted, false));
     }
 }
 ```
@@ -262,7 +262,7 @@ public class ClassOrgNode extends OrgNode {
 public class OrgCache {
 
     private final DeptMapper deptMapper;
-    private final BizOrgExtMapper bizOrgExtMapper;
+    private final HeOrgExtMapper heOrgExtMapper;
     private final OrgConvert orgConvert;
     // 注意：不依赖 TenantFrameworkService，不使用 TenantUtils.run()
     // 本系统无多租户需求，直接全量查询即可
@@ -294,14 +294,14 @@ public class OrgCache {
         List<DeptDO> depts = deptMapper.selectList(
                 new LambdaQueryWrapperX<DeptDO>().eq(DeptDO::getDeleted, false));
 
-        // 2. 全量查 BizOrgExtDO（已标注 @DataPermission(enable=false)）
-        List<BizOrgExtDO> exts = bizOrgExtMapper.selectListAll();
+        // 2. 全量查 HeOrgExtDO（已标注 @DataPermission(enable=false)）
+        List<HeOrgExtDO> exts = heOrgExtMapper.selectListAll();
 
         // 3. 在 Java 内存中 Left Join（O(N)）
-        Map<Long, BizOrgExtDO> extMap = CollectionUtils.convertMap(exts, BizOrgExtDO::getDeptId);
+        Map<Long, HeOrgExtDO> extMap = CollectionUtils.convertMap(exts, HeOrgExtDO::getDeptId);
         Map<Long, OrgNode> nodeMap = new HashMap<>(depts.size());
         for (DeptDO dept : depts) {
-            BizOrgExtDO ext = extMap.get(dept.getId());
+            HeOrgExtDO ext = extMap.get(dept.getId());
             // 若 ext 为 null，说明是纯系统部门（未关联业务），跳过
             if (ext == null) continue;
             OrgNode node = orgConvert.toNode(dept, ext);
@@ -371,7 +371,7 @@ public interface OrgService {
     /**
      * 创建组织节点。
      * cmd 为多态类型，CLASS 时携带 grade/eduLevel，其余类型字段为空。
-     * 内部：先调用 DeptService.createDept() 获取 deptId，再插入 biz_org_extension。
+     * 内部：先调用 DeptService.createDept() 获取 deptId，再插入 he_org_extension。
      */
     Long createOrg(OrgSaveReqVO cmd);
 
@@ -434,7 +434,7 @@ public interface OrgService {
 public class OrgServiceImpl implements OrgService {
 
     private final DeptService deptService;          // system 底层，写路径代理
-    private final BizOrgExtMapper bizOrgExtMapper;  // 附表读写
+    private final HeOrgExtMapper heOrgExtMapper;  // 附表读写
     private final OrgCache orgCache;                // 内存缓存
     private final OrgConvert orgConvert;            // DO ↔ VO 转换
     private final RedisMQTemplate redisMQTemplate;  // 发布缓存刷新消息
@@ -453,9 +453,9 @@ public class OrgServiceImpl implements OrgService {
         Long deptId = deptService.createDept(deptReq);
         // 底层自动处理：id 生成、path 拼装、parentId 校验
 
-        // Step 3: 构建 BizOrgExtDO 插入附表
-        BizOrgExtDO extDO = orgConvert.toExtDO(deptId, cmd);
-        bizOrgExtMapper.insert(extDO);
+        // Step 3: 构建 HeOrgExtDO 插入附表
+        HeOrgExtDO extDO = orgConvert.toExtDO(deptId, cmd);
+        heOrgExtMapper.insert(extDO);
 
         // Step 4: 广播缓存刷新
         publishCacheRefresh();
@@ -476,8 +476,8 @@ public class OrgServiceImpl implements OrgService {
         deptService.updateDept(orgConvert.toDeptSaveReq(cmd));
 
         // Step 3: 更新附表
-        BizOrgExtDO extDO = orgConvert.toExtDO(cmd.getId(), cmd);
-        bizOrgExtMapper.updateById(extDO);
+        HeOrgExtDO extDO = orgConvert.toExtDO(cmd.getId(), cmd);
+        heOrgExtMapper.updateById(extDO);
 
         publishCacheRefresh();
     }
@@ -498,7 +498,7 @@ public class OrgServiceImpl implements OrgService {
         }
 
         // Step 2: 删除附表（先删业务侧，避免外键悬空）
-        bizOrgExtMapper.deleteById(id);
+        heOrgExtMapper.deleteById(id);
 
         // Step 3: 删除底层 dept（底层会处理自己的 @CacheEvict）
         deptService.deleteDept(id);
@@ -569,7 +569,7 @@ public class OrgServiceImpl implements OrgService {
     public OrgRespVO getOrgDirect(Long id) {
         DeptDO dept = deptService.getDept(id);
         if (dept == null) throw exception(ORG_NOT_EXISTS);
-        BizOrgExtDO ext = bizOrgExtMapper.selectByDeptId(id);
+        HeOrgExtDO ext = heOrgExtMapper.selectByDeptId(id);
         OrgNode node = orgConvert.toNode(dept, ext);
         return orgConvert.toRespVO(node);
     }
@@ -729,7 +729,7 @@ public class OrgServiceImpl implements OrgService {
     public OrgRespVO getOrgDirect(Long id) {
         DeptDO dept = deptService.getDept(id);
         if (dept == null) throw exception(ORG_NOT_EXISTS);
-        BizOrgExtDO ext = bizOrgExtMapper.selectByDeptId(id);
+        HeOrgExtDO ext = heOrgExtMapper.selectByDeptId(id);
         OrgNode node = orgConvert.toNode(dept, ext);
         return orgConvert.toRespVO(node);
     }
@@ -740,11 +740,11 @@ public class OrgServiceImpl implements OrgService {
         List<DeptDO> depts = deptService.getDeptList(new DeptListReqVO());
         if (CollUtil.isEmpty(depts)) return Collections.emptyList();
         
-        List<BizOrgExtDO> exts = bizOrgExtMapper.selectList(new LambdaQueryWrapperX<BizOrgExtDO>());
-        Map<Long, BizOrgExtDO> extMap = CollectionUtils.convertMap(exts, BizOrgExtDO::getDeptId);
+        List<HeOrgExtDO> exts = heOrgExtMapper.selectList(new LambdaQueryWrapperX<HeOrgExtDO>());
+        Map<Long, HeOrgExtDO> extMap = CollectionUtils.convertMap(exts, HeOrgExtDO::getDeptId);
         
         return depts.stream().map(dept -> {
-            BizOrgExtDO ext = extMap.get(dept.getId());
+            HeOrgExtDO ext = extMap.get(dept.getId());
             if (ext == null) return null;
             OrgNode node = orgConvert.toNode(dept, ext);
             if (!matchesQuery(node, query)) return null;
@@ -994,8 +994,8 @@ public class OrgController {
 ```java
 /**
  * 职责：
- *   1. DeptDO + BizOrgExtDO  → OrgNode (具体子类，按 orgType dispatch)
- *   2. OrgSaveReqVO           → DeptSaveReqVO + BizOrgExtDO
+ *   1. DeptDO + HeOrgExtDO  → OrgNode (具体子类，按 orgType dispatch)
+ *   2. OrgSaveReqVO           → DeptSaveReqVO + HeOrgExtDO
  *   3. OrgNode                → OrgRespVO (具体子类)
  *
  * 采用手写 Convert 而非 MapStruct，原因：
@@ -1005,7 +1005,7 @@ public class OrgController {
 @Component
 public class OrgConvert {
 
-    public OrgNode toNode(DeptDO dept, BizOrgExtDO ext) {
+    public OrgNode toNode(DeptDO dept, HeOrgExtDO ext) {
         OrgType orgType = OrgType.valueOf(ext.getOrgType());
         OrgNode node = switch (orgType) {
             case SCHOOL, COLLEGE, MAJOR, REGULAR_DEPT -> new GenericOrgNode();
@@ -1073,8 +1073,8 @@ public class OrgConvert {
         return req;
     }
 
-    public BizOrgExtDO toExtDO(Long deptId, OrgSaveReqVO cmd) {
-        BizOrgExtDO ext = new BizOrgExtDO();
+    public HeOrgExtDO toExtDO(Long deptId, OrgSaveReqVO cmd) {
+        HeOrgExtDO ext = new HeOrgExtDO();
         ext.setDeptId(deptId);
         ext.setCode(cmd.getCode());
         ext.setOrgType(cmd.getOrgType().name());
@@ -1114,7 +1114,7 @@ rule.addDeptColumn(DeptDO.class, "id"); // system_dept.id 受数据权限保护
 ### 9.3 缓存加载时必须关闭数据权限
 
 `OrgCache.reload()` 是系统级操作，必须绕过数据权限（否则可能因为 SecurityContext 为空而失败，或缓存内容不完整）。解决方案：
-- `BizOrgExtMapper.selectListByTenantId()` 标注 `@DataPermission(enable = false)`
+- `HeOrgExtMapper.selectListByTenantId()` 标注 `@DataPermission(enable = false)`
 - `DeptMapper` 查询时，使用 `TenantUtils.run()` 包裹，内部开一个无权限上下文
 
 ---
@@ -1138,7 +1138,7 @@ rule.addDeptColumn(DeptDO.class, "id"); // system_dept.id 受数据权限保护
 在最终落地前，我们针对该架构进行了中高级别隐患排查，结论与应对策略如下：
 
 1. **跨模块事务问题（主附表不一致）**
-   - *隐患*：`system_dept` 与 `biz_org_extension` 的跨模块调用若未来微服务化，会导致 `@Transactional` 失效。
+   - *隐患*：`system_dept` 与 `he_org_extension` 的跨模块调用若未来微服务化，会导致 `@Transactional` 失效。
    - *决策*：**无视**。系统未来不打算进行微服务化拆分和分库隔离，单体架构下 `@Transactional` 足够保证本地事务强一致性。
 
 2. **缓存刷新的全量风暴**
@@ -1157,7 +1157,7 @@ rule.addDeptColumn(DeptDO.class, "id"); // system_dept.id 受数据权限保护
 
 ## 十二、实现优先级与顺序
 
-1. **DDL + BizOrgExtDO + BizOrgExtMapper** （先建好基础，可以跑通 CRUD）
+1. **DDL + HeOrgExtDO + HeOrgExtMapper** （先建好基础，可以跑通 CRUD）
 2. **枚举：OrgType / BizLine / OrgLifecycle**
 3. **OrgNode 继承体系**（SCHOOL / COLLEGE / MAJOR / CLASS）
 4. **OrgConvert**（`toNode()` / `toRespVO()` / `toExtDO()`）
