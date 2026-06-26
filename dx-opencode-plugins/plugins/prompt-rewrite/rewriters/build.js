@@ -7,7 +7,10 @@ const MAIN_MD = fs.readFileSync(
   "utf-8",
 )
 
-/** @param {string[]} system */
+// 仅对 build agent 生效
+export const match = ({ agent }) => agent === "build"
+
+// 将自定义指令追加到首段 system prompt
 export default function (system) {
-  system[0] = system[0] + MAIN_MD
+  system[0] += MAIN_MD
 }
